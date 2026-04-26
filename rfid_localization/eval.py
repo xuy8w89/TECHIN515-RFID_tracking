@@ -207,6 +207,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=str, default="checkpoints/rfid_dual_branch_2d.pt")
     ap.add_argument("--data_dir", type=str, default="data")
+    ap.add_argument(
+        "--val_dir",
+        type=str,
+        default="",
+        help="if set (or stored in checkpoint), use this folder as val; --data_dir as train. Overrides --split.",
+    )
     ap.add_argument("--eval_set", type=str, default="val", choices=["val", "train", "all"])
     ap.add_argument("--split", type=str, default="", help="temporal|merged_random; empty = read from checkpoint")
     ap.add_argument("--val_ratio", type=float, default=0.2)
@@ -251,29 +257,49 @@ def main() -> None:
         split = "temporal"
     val_ratio = float(ckpt.get("val_ratio", args.val_ratio))
     seed = int(ckpt.get("seed", args.seed))
+    unwrap_method = str(ckpt.get("unwrap_method", "arctan2"))
+    recover = bool(ckpt.get("recover", False))
 
     data_dir = Path(args.data_dir)
     paths = load_csv_paths(data_dir)
     if not paths:
         raise SystemExit(f"No CSV under {data_dir}")
 
+    val_dir_str = args.val_dir.strip() or str(ckpt.get("val_dir", ""))
+    val_dir = Path(val_dir_str) if val_dir_str else None
+    val_paths: list[Path] = []
+    if val_dir is not None:
+        val_paths = load_csv_paths(val_dir)
+        if not val_paths:
+            raise SystemExit(f"--val_dir {val_dir} has no CSV")
+
     df0 = pd.read_csv(paths[0])
     live = discover_channel_pairs(df0.columns)
     if tuple(live) != tuple(pairs):
         print("Warning: CSV columns differ from checkpoint pairs; using checkpoint list.")
 
-    build_kw = dict(phase_period=phase_period, conf_lambda=conf_lambda)
-    full_ds = _build_full_ds(paths, pairs, r_mean, r_std, build_kw, window, offset)
-    tr_idx, va_idx = train_val_indices(len(full_ds), val_ratio, split, seed)
-    train_ds = Subset(full_ds, tr_idx)
-    val_ds = Subset(full_ds, va_idx)
+    build_kw = dict(
+        phase_period=phase_period,
+        conf_lambda=conf_lambda,
+        unwrap_method=unwrap_method,
+        recover=recover,
+    )
+    if val_dir is not None:
+        train_ds = _build_full_ds(paths, pairs, r_mean, r_std, build_kw, window, offset)
+        val_ds = _build_full_ds(val_paths, pairs, r_mean, r_std, build_kw, window, offset)
+        full_ds = val_ds  # for --plots_dir path that uses val_ds directly
+    else:
+        full_ds = _build_full_ds(paths, pairs, r_mean, r_std, build_kw, window, offset)
+        tr_idx, va_idx = train_val_indices(len(full_ds), val_ratio, split, seed)
+        train_ds = Subset(full_ds, tr_idx)
+        val_ds = Subset(full_ds, va_idx)
 
     if args.eval_set == "train":
         ds = train_ds
     elif args.eval_set == "val":
         ds = val_ds
     else:
-        ds = full_ds
+        ds = full_ds if val_dir is None else val_ds
 
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, drop_last=False, collate_fn=collate)
 

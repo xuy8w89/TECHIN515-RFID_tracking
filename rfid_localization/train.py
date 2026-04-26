@@ -85,6 +85,12 @@ def compute_losses(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data")
+    ap.add_argument(
+        "--val_dir",
+        type=str,
+        default="",
+        help="if set, all CSVs in --data_dir are training and all CSVs here are validation; overrides --split",
+    )
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -99,6 +105,18 @@ def main() -> None:
     ap.add_argument("--d_ch", type=int, default=32)
     ap.add_argument("--vel_scale", type=float, default=0.08)
     ap.add_argument("--out", type=str, default="checkpoints/rfid_dual_branch_2d.pt")
+    ap.add_argument(
+        "--unwrap_method",
+        type=str,
+        default="arctan2",
+        choices=["arctan2", "algo"],
+        help="arctan2 = current min-angle wrap; algo = algorithm/features/phase.py integer-k unwrap",
+    )
+    ap.add_argument(
+        "--recover",
+        action="store_true",
+        help="when --unwrap_method algo, also run Ridge cross-tag recover for missing phase",
+    )
     ap.add_argument(
         "--split",
         type=str,
@@ -123,6 +141,13 @@ def main() -> None:
     if not paths:
         raise SystemExit(f"No CSV under {data_dir}")
 
+    val_dir = Path(args.val_dir) if args.val_dir else None
+    val_paths: list[Path] = []
+    if val_dir is not None:
+        val_paths = load_csv_paths(val_dir)
+        if not val_paths:
+            raise SystemExit(f"--val_dir set but no CSV under {val_dir}")
+
     df0 = pd.read_csv(paths[0])
     pairs = discover_channel_pairs(df0.columns)
     if not pairs:
@@ -133,9 +158,18 @@ def main() -> None:
     build_kw = dict(
         phase_period=args.phase_period,
         conf_lambda=args.conf_lambda,
+        unwrap_method=args.unwrap_method,
+        recover=bool(args.recover),
     )
 
-    if len(paths) >= 2 and args.split == "last_file":
+    if val_dir is not None:
+        tbl_tr = stack_tables(paths, pairs, r_mean, r_std, **build_kw)
+        tbl_va = stack_tables(val_paths, pairs, r_mean, r_std, **build_kw)
+        vb = tbl_tr["valid_xy"].astype(bool)
+        offset = tbl_tr["xy"][vb].mean(axis=0) if np.any(vb) else np.zeros(2, dtype=np.float32)
+        train_ds = RFIDTrackingWindowDataset(tbl_tr, window=args.window, xy_offset=offset)
+        val_ds = RFIDTrackingWindowDataset(tbl_va, window=args.window, xy_offset=offset)
+    elif len(paths) >= 2 and args.split == "last_file":
         tbl_tr = stack_tables(paths[:-1], pairs, r_mean, r_std, **build_kw)
         tbl_va = stack_tables(paths[-1:], pairs, r_mean, r_std, **build_kw)
         vb = tbl_tr["valid_xy"].astype(bool)
@@ -152,8 +186,9 @@ def main() -> None:
         train_ds = Subset(full_ds, tr_idx)
         val_ds = Subset(full_ds, va_idx)
 
+    split_desc = f"val_dir={val_dir}" if val_dir is not None else f"split={args.split}"
     print(
-        f"split={args.split}  channels={len(pairs)}  "
+        f"{split_desc}  channels={len(pairs)}  "
         f"train_windows={len(train_ds)}  val_windows={len(val_ds)}"
     )
     if len(train_ds) == 0 or len(val_ds) == 0:
@@ -250,6 +285,10 @@ def main() -> None:
                     "split": args.split,
                     "seed": args.seed,
                     "val_ratio": args.val_ratio,
+                    "unwrap_method": args.unwrap_method,
+                    "recover": bool(args.recover),
+                    "data_dir": str(data_dir),
+                    "val_dir": str(val_dir) if val_dir is not None else "",
                 },
                 out_path,
             )
