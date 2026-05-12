@@ -147,7 +147,7 @@ class ArmHeatmapEncoder:
         # =================================================
         x0 = hand_point[0]
         y0 = hand_point[1]
-        z0 = hand_point[2]
+        z0 = hand_point[2] + 0.05
 
         # ray direction
         dx = direction[0]
