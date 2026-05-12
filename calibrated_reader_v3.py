@@ -113,7 +113,7 @@ while cap.isOpened():
             # ======================
             # Hand (ID = 0)
             # ======================
-            if marker_id == 0:
+            if marker_id == 1:
 
                 hand_xyz = tvec
                 hand_rvec = rvec
@@ -140,7 +140,7 @@ while cap.isOpened():
             # ======================
             # Arm (ID = 1)
             # ======================
-            elif marker_id == 1:
+            elif marker_id == 0:
 
                 arm_xyz = tvec
                 arm_rvec = rvec
