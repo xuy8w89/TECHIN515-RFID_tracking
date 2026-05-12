@@ -83,12 +83,16 @@ while cap.isOpened():
     # ==========================
     # 1️⃣ ArUco 检测
     # ==========================
-    interaction_id = -1   # 默认无交互
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     corners, ids, _ = detector.detectMarkers(gray)
 
-    wrist_xyz = None
+    # 初始化
+    hand_xyz = None
+    hand_rvec = None
+
+    arm_xyz = None
+    arm_rvec = None
 
     if ids is not None:
 
@@ -101,20 +105,18 @@ while cap.isOpened():
             dist_coeffs
         )
 
-        wrist_xyz = None
-        wrist_rvec = None   # ✅ 新增
         for i, marker_id in enumerate(ids.flatten()):
 
-            # ======================
-            # Wrist (ID = 1)
-            # ======================
-            if marker_id == 1:
+            tvec = tvecs[i][0]
+            rvec = rvecs[i][0]
 
-                tvec = tvecs[i][0]
-                rvec = rvecs[i][0]
+            # ======================
+            # Hand (ID = 0)
+            # ======================
+            if marker_id == 0:
 
-                wrist_xyz = tvec
-                wrist_rvec = rvec
+                hand_xyz = tvec
+                hand_rvec = rvec
 
                 cv2.drawFrameAxes(
                     frame,
@@ -125,28 +127,42 @@ while cap.isOpened():
                     0.03
                 )
 
-                cv2.putText(frame,
-                            f"Wrist: {tvec.round(3)}",
-                            (10, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (0,255,0), 2)
+                cv2.putText(
+                    frame,
+                    f"Hand: {tvec.round(3)}",
+                    (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0,255,0),
+                    2
+                )
 
             # ======================
-            # Interaction (ID = 2~4)
+            # Arm (ID = 1)
             # ======================
-            elif marker_id in [2, 3, 4]:
+            elif marker_id == 1:
 
-                # 只记录第一个，保证唯一性
-                if interaction_id == -1:
-                    interaction_id = int(marker_id)
+                arm_xyz = tvec
+                arm_rvec = rvec
 
-                    cv2.putText(frame,
-                                f"Interaction ID: {interaction_id}",
-                                (10, 100),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (255, 0, 0),
-                                2)
+                cv2.drawFrameAxes(
+                    frame,
+                    camera_matrix,
+                    dist_coeffs,
+                    rvecs[i],
+                    tvec,
+                    0.03
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Arm: {tvec.round(3)}",
+                    (10, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255,0,0),
+                    2
+                )
 
     # ==========================
     # 2️⃣ RFID
@@ -186,19 +202,33 @@ while cap.isOpened():
     if recording:
 
         row = {
-            "timestamp": timestamp,
-            "interaction_id": interaction_id
+            "timestamp": timestamp
         }
+        # ======================
+        # Hand marker (ID=0)
+        # ======================
+        if hand_xyz is not None:
+            row["HAND_x"] = hand_xyz[0]
+            row["HAND_y"] = hand_xyz[1]
+            row["HAND_z"] = hand_xyz[2]
 
-        if wrist_xyz is not None:
-            row["WRIST_x"] = wrist_xyz[0]
-            row["WRIST_y"] = wrist_xyz[1]
-            row["WRIST_z"] = wrist_xyz[2]
+        if hand_rvec is not None:
+            row["HAND_rx"] = hand_rvec[0]
+            row["HAND_ry"] = hand_rvec[1]
+            row["HAND_rz"] = hand_rvec[2]
 
-        if wrist_rvec is not None:
-            row["WRIST_rx"] = wrist_rvec[0]
-            row["WRIST_ry"] = wrist_rvec[1]
-            row["WRIST_rz"] = wrist_rvec[2]
+        # ======================
+        # Arm marker (ID=1)
+        # ======================
+        if arm_xyz is not None:
+            row["ARM_x"] = arm_xyz[0]
+            row["ARM_y"] = arm_xyz[1]
+            row["ARM_z"] = arm_xyz[2]
+
+        if arm_rvec is not None:
+            row["ARM_rx"] = arm_rvec[0]
+            row["ARM_ry"] = arm_rvec[1]
+            row["ARM_rz"] = arm_rvec[2]
 
         for (antenna_id, epc), (rssi, phase) in rfid_data.items():
             row[f"ant{antenna_id}_{epc}_rssi"] = rssi
@@ -220,9 +250,7 @@ while cap.isOpened():
                 2)
     frame = draw_grid(frame, grid_size=60)
 
-    cv2.imshow("ArUco Wrist + RFID", frame)
-
-   
+    cv2.imshow("Hand Arm RFID Tracking", frame)
 
     key = cv2.waitKey(1) & 0xFF
 
