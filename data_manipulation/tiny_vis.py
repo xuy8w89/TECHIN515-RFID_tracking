@@ -122,7 +122,7 @@ class ArmHeatmapEncoder:
         # =================================================
         # ray direction
         # =================================================
-        direction = hand_point - arm_point
+        direction = arm_point - hand_point
 
         # =================================================
         # 限制 z 非负
@@ -428,8 +428,6 @@ def load_csv(csv_path, plane_path="plane_calibration_flipped.npz"):
         arm_points,
         alpha=0.5
     )
-
-    return hand_points, arm_points
 
     return hand_points, arm_points
 
