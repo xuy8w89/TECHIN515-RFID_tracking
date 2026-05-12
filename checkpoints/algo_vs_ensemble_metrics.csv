@@ -1,0 +1,19 @@
+category,metric,unit,algo (DualBranch + algo unwrap),V5 ensemble (3x CNN+GRU + anchor),relative change
+Position accuracy,RMSE (L2),cm,7.35,5.01,-31.8%
+Position accuracy,MAE (L2),cm,6.20,4.21,-32.1%
+Position accuracy,RMSE x,cm,6.26,3.30,-47.3%
+Position accuracy,RMSE y,cm,3.84,3.78,-1.6%
+Position accuracy,MAE x,cm,4.86,2.49,-48.8%
+Position accuracy,MAE y,cm,2.91,2.84,-2.4%
+Fine-grained hit rate,hit_rate@2cm,fraction,0.167,0.204,+22.2%
+Velocity accuracy,RMSE (L2),cm/step,4.35,3.60,-17.2%
+Velocity accuracy,RMSE vx,cm/step,3.44,2.37,-31.1%
+Velocity accuracy,RMSE vy,cm/step,2.66,2.70,+1.5%
+Trajectory consistency,per-window mean L2 (mean),cm,6.20,4.21,-32.1%
+Trajectory consistency,per-window mean L2 (std),cm,1.74,1.40,-19.5%
+Trajectory consistency,per-window final-step L2 (mean),cm,7.69,4.40,-42.8%
+Trajectory consistency,per-window final-step L2 (std),cm,3.88,2.79,-28.1%
+Trajectory consistency,temporal smoothness E||v_t - v_(t-1)||,m/step,0.0153,0.0164,+7.2%
+Resource / real-time,parameters,count,134000,534000,+298.5%
+Resource / real-time,per-frame latency (CPU 14 thread),ms,0.91,1.27,+39.6%
+Resource / real-time,equivalent throughput,Hz,1094,790,-27.8%

@@ -40,6 +40,73 @@ def discover_channel_pairs(columns: Sequence[str]) -> list[tuple[str, str]]:
     return pairs
 
 
+def discover_grid_layout(pairs: list[tuple[str, str]]) -> dict:
+    """Map ``pairs`` into a (n_antennas x n_tags) grid for CNN input.
+
+    Rows     : sorted antenna names (e.g. ant1 -> row 0, ant4 -> row 1)
+    Columns  : sorted tag ids
+    Returns a dict with::
+        cell_to_channel : [H, W] int, channel index in ``pairs`` (-1 if absent)
+        local_xy        : [H, W, 2] float, A4 corner coords for 4 tags.
+                          Camera frame is left-right flipped w.r.t. the
+                          physical tag layout, so sorted tag ids map to
+                          (TR, TL, BR, BL) for cols 0..3.
+        ant_order       : list[str]
+        tag_order       : list[str]
+    """
+    parsed: list[tuple[str, str]] = []
+    ants: list[str] = []
+    tags: list[str] = []
+    for ph, _rs in pairs:
+        parts = ph.split("_")
+        if len(parts) < 3:
+            raise ValueError(f"Unexpected phase column: {ph!r}")
+        ant = parts[0]
+        tag = parts[1]
+        parsed.append((ant, tag))
+        ants.append(ant)
+        tags.append(tag)
+    ant_order = sorted(set(ants))
+    tag_order = sorted(set(tags))
+    H, W = len(ant_order), len(tag_order)
+    cell_to_channel = np.full((H, W), -1, dtype=np.int64)
+    for idx, (ant, tag) in enumerate(parsed):
+        r = ant_order.index(ant)
+        c = tag_order.index(tag)
+        if cell_to_channel[r, c] != -1:
+            raise ValueError(f"Duplicate cell ({ant},{tag}) in pairs")
+        cell_to_channel[r, c] = idx
+
+    if W == 4:
+        # A4 paper ~ 297x210 (sqrt(2):1). Camera is left-right flipped vs the
+        # physical layout, so sorted tag ids map to TR, TL, BR, BL.
+        corners = np.array(
+            [
+                [+1.414, +1.0],
+                [-1.414, +1.0],
+                [+1.414, -1.0],
+                [-1.414, -1.0],
+            ],
+            dtype=np.float32,
+        )
+        local_xy_w = corners
+    else:
+        local_xy_w = np.zeros((W, 2), dtype=np.float32)
+        for c in range(W):
+            local_xy_w[c, 0] = (c / max(W - 1, 1)) * 2.0 - 1.0
+
+    local_xy = np.broadcast_to(local_xy_w[None, :, :], (H, W, 2)).copy()
+
+    return {
+        "cell_to_channel": cell_to_channel,
+        "local_xy": local_xy,
+        "H": int(H),
+        "W": int(W),
+        "ant_order": ant_order,
+        "tag_order": tag_order,
+    }
+
+
 def compute_rssi_norm(
     dfs: list[pd.DataFrame],
     pairs: list[tuple[str, str]],
@@ -69,6 +136,91 @@ def _wrap_angle(delta: np.ndarray) -> np.ndarray:
     return np.arctan2(np.sin(delta), np.cos(delta))
 
 
+def unwrap_phase_algo(
+    raw: np.ndarray,
+    mask: np.ndarray,
+    phase_period: float = 2048.0,
+) -> np.ndarray:
+    """Algorithm-style integer-k unwrap (mirrors algorithm/features/phase.py).
+
+    raw  : [N] phase samples in raw period units; NaN allowed.
+    mask : [N] bool, True where the sample is real (not imputed/missing).
+
+    Returns absolute cumulative unwrapped phase in raw units (can grow unbounded).
+    Reference for choosing the integer wrap count:
+      - if previous sample was real, use unwrapped[i-1]
+      - else, use the unwrapped value at the most recent real index (no drift across gaps)
+    """
+    n = int(raw.shape[0])
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    s = pd.Series(raw)
+    filled = s.ffill().bfill().to_numpy(dtype=np.float64)
+    if not np.any(np.isfinite(filled)):
+        return np.zeros(n, dtype=np.float64)
+    filled = np.where(np.isfinite(filled), filled, 0.0)
+
+    unwrapped = np.zeros(n, dtype=np.float64)
+    unwrapped[0] = float(filled[0])
+    last_valid_idx = 0
+    period = float(phase_period)
+    for i in range(1, n):
+        p = float(filled[i])
+        if bool(mask[i - 1]):
+            ref = unwrapped[i - 1]
+            last_valid_idx = i - 1
+        else:
+            ref = unwrapped[last_valid_idx]
+        k = np.round((ref - p) / period)
+        unwrapped[i] = p + k * period
+    return unwrapped
+
+
+def recover_phase_ridge(
+    unwrapped: np.ndarray,
+    masks: np.ndarray,
+    rssi_fill: np.ndarray,
+) -> np.ndarray:
+    """Per-channel Ridge regression to overwrite missing phase positions.
+
+    unwrapped : [N, C] absolute unwrapped phase (no NaN; ffilled internally).
+    masks     : [N, C] in {0,1}; 1 = real observation.
+    rssi_fill : [N, C] forward-filled RSSI (no NaN expected).
+
+    For each target channel t, regress unwrapped[:,t] on
+      (other channels' unwrapped) + (other channels' rssi)
+    using only positions where masks[:,t]==1, then overwrite predictions at
+    positions where masks[:,t]==0.
+    """
+    try:
+        from sklearn.linear_model import Ridge
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit("recover=True requires scikit-learn") from e
+
+    n, c = unwrapped.shape
+    refined = unwrapped.copy()
+    for tgt in range(c):
+        others = [j for j in range(c) if j != tgt]
+        if not others:
+            continue
+        X = np.concatenate(
+            [unwrapped[:, others], rssi_fill[:, others]], axis=1
+        ).astype(np.float64)
+        y = unwrapped[:, tgt].astype(np.float64).copy()
+        valid = masks[:, tgt] > 0.5
+        finite_X = np.all(np.isfinite(X), axis=1)
+        train_mask = valid & finite_X
+        if int(train_mask.sum()) < 10:
+            continue
+        model = Ridge()
+        model.fit(X[train_mask], y[train_mask])
+        missing = (~valid) & finite_X
+        if int(missing.sum()) > 0:
+            y[missing] = model.predict(X[missing])
+        refined[:, tgt] = y
+    return refined
+
+
 def build_enriched_table(
     df: pd.DataFrame,
     pairs: list[tuple[str, str]],
@@ -77,6 +229,9 @@ def build_enriched_table(
     phase_period: float = 2048.0,
     conf_lambda: float = 0.35,
     max_tslv_clip_s: float = 30.0,
+    unwrap_method: str = "arctan2",
+    recover: bool = False,
+    pdoa_pair_indices: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Returns dict with:
@@ -147,8 +302,25 @@ def build_enriched_table(
             else:
                 tslv[i, j] = float(max_tslv_clip_s)
 
-    p_wrapped = np.mod(phase_fill.astype(np.float64), float(phase_period))
-    ang = (2.0 * math.pi) * (p_wrapped / float(phase_period))
+    method = (unwrap_method or "arctan2").lower()
+    if method not in ("arctan2", "algo"):
+        raise ValueError(f"unwrap_method must be 'arctan2' or 'algo', got {unwrap_method!r}")
+
+    if method == "algo":
+        unwrapped_abs = np.zeros((n, c), dtype=np.float64)
+        for j in range(c):
+            unwrapped_abs[:, j] = unwrap_phase_algo(
+                phase_obs[:, j], m_p[:, j] > 0.5, phase_period=float(phase_period)
+            )
+        if recover:
+            unwrapped_abs = recover_phase_ridge(
+                unwrapped_abs, m_p.astype(np.float32), rssi_fill.astype(np.float64)
+            )
+        phase_for_sincos = np.mod(unwrapped_abs, float(phase_period))
+    else:
+        phase_for_sincos = np.mod(phase_fill.astype(np.float64), float(phase_period))
+
+    ang = (2.0 * math.pi) * (phase_for_sincos / float(phase_period))
     sin_p = np.sin(ang).astype(np.float32)
     cos_p = np.cos(ang).astype(np.float32)
 
@@ -174,13 +346,19 @@ def build_enriched_table(
     unwrap_vel = np.zeros((n, c), dtype=np.float32)
     unw = np.zeros((n, c), dtype=np.float64)
 
+    rad_per_unit = (2.0 * math.pi) / float(phase_period)
+
     for i in range(1, n):
         dti = float(dt[i])
         if dti <= 0:
             continue
-        th_prev = (2.0 * math.pi) * (np.mod(phase_fill[i - 1], float(phase_period)) / float(phase_period))
-        th_cur = (2.0 * math.pi) * (np.mod(phase_fill[i], float(phase_period)) / float(phase_period))
-        dth = _wrap_angle(th_cur - th_prev)
+        if method == "algo":
+            # Algorithm-style unwrap is already continuous: differentiate directly.
+            dth = (unwrapped_abs[i] - unwrapped_abs[i - 1]) * rad_per_unit
+        else:
+            th_prev = (2.0 * math.pi) * (np.mod(phase_fill[i - 1], float(phase_period)) / float(phase_period))
+            th_cur = (2.0 * math.pi) * (np.mod(phase_fill[i], float(phase_period)) / float(phase_period))
+            dth = _wrap_angle(th_cur - th_prev)
         p_dot[i, :] = (dth / dti).astype(np.float32)
         both_p = (m_p[i, :] > 0.5) & (m_p[i - 1, :] > 0.5)
         m_pdot[i, :] = both_p.astype(np.float32)
@@ -215,6 +393,34 @@ def build_enriched_table(
         ],
         axis=-1,
     ).astype(np.float32)
+
+    # Optional PDoA features (sin, cos of antenna-pair phase difference per tag).
+    # `pdoa_pair_indices`: int array of shape [n_pairs, 2], each row = (ch_a, ch_b).
+    # For each pair, we compute d = wrap(ang_a - ang_b), then store
+    #   ch_a slot: ( +sin(d),  cos(d) )
+    #   ch_b slot: ( -sin(d),  cos(d) )   (sin antisymmetric, cos symmetric)
+    # Channels not listed in any pair stay zero in both slots.
+    if pdoa_pair_indices is not None:
+        idx = np.asarray(pdoa_pair_indices, dtype=np.int64)
+        if idx.ndim != 2 or idx.shape[-1] != 2:
+            raise ValueError(
+                f"pdoa_pair_indices must have shape [n_pairs, 2], got {idx.shape}"
+            )
+        pdoa_sin = np.zeros((n, c), dtype=np.float32)
+        pdoa_cos = np.zeros((n, c), dtype=np.float32)
+        ang_all = (2.0 * math.pi) * (phase_for_sincos / float(phase_period))
+        for ch_a, ch_b in idx:
+            d = _wrap_angle(ang_all[:, int(ch_a)] - ang_all[:, int(ch_b)])
+            sd = np.sin(d).astype(np.float32)
+            cd = np.cos(d).astype(np.float32)
+            pdoa_sin[:, int(ch_a)] = +sd
+            pdoa_sin[:, int(ch_b)] = -sd
+            pdoa_cos[:, int(ch_a)] = cd
+            pdoa_cos[:, int(ch_b)] = cd
+        ch_feats = np.concatenate(
+            [ch_feats, pdoa_sin[..., None], pdoa_cos[..., None]],
+            axis=-1,
+        ).astype(np.float32)
 
     dead = (m_r < 0.5) & (m_p < 0.5) & (imp_r < 0.5) & (imp_p < 0.5)
     attn_invalid = dead
